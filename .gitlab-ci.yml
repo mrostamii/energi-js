@@ -1,0 +1,108 @@
+stages:
+  - build
+  - test_prod
+  - review_prod
+  - deploy_develop
+  - deploy_stage
+  - deploy_prod
+
+variables:
+  IMAGE_TAG: $CI_COMMIT_REF_NAME-CI_COMMIT_SHORT_SHA
+  IMAGE_NAME: registry.domain.com/mrostamii/energi-js:$IMAGE_TAG
+
+build:
+  stage: build
+  image: docker:latest
+  services:
+    - name: docker:dind
+  variables:
+    DOCKER_HOST: tcp://localhost:2375
+  script:
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN registry.gitlab.com
+    - docker build -f Dockerfile --tag ${IMAGE_NAME} .
+    - docker push ${IMAGE_NAME}
+    - docker rmi ${IMAGE_NAME}
+  tags:
+    - docker-runner
+  only:
+    refs:
+      - develop
+      - stage
+      - prod
+
+test prod:
+  stage: test_prod
+  image: node:14.18.1-alpine
+  script:
+    - node test.js
+  after_script:
+    - |
+        curl -X POST -H 'Content-type: application/json' --data '{"text":"*### TEST PROD FAILED*\n image: $IMAGE_NAME"}' https://hooks.slack.com/services/$SLACK_HOOK
+  tags:
+    - docker-runner
+  only:
+    refs:
+      - prod
+
+review prod:
+  stage: review_prod
+  image: 
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+    - .sonar/cache
+  script: 
+    - sonar-scanner
+  allow_failure: true
+  tags:
+    - sonar-runner
+  only:
+    refs:
+      - prod
+
+deploy develop:
+  stage: deploy_develop
+  image: alpine:ssh
+  script:
+    - chmod og= $ID_RSA
+    - ssh -p $DEVELOP_SERVER_PORT -i $ID_RSA -o StrictHostKeyChecking=no $DEVELOP_SERVER_USER@$DEVELOP_SERVER_IP "docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY"
+    - ssh -p $DEVELOP_SERVER_PORT -i $ID_RSA -o StrictHostKeyChecking=no $DEVELOP_SERVER_USER@$DEVELOP_SERVER_IP "docker pull $IMAGE_NAME"
+    - ssh -p $DEVELOP_SERVER_PORT -i $ID_RSA -o StrictHostKeyChecking=no $DEVELOP_SERVER_USER@$DEVELOP_SERVER_IP "docker service update --force energi-js-dev"
+  tags:
+    - docker-runner
+  only:
+    refs:
+      - develop
+
+deploy stage:
+  stage: deploy_stage
+  image: alpine:ssh
+  script:
+    - chmod og= $ID_RSA
+    - ssh -p $STAGE_SERVER_PORT -i $ID_RSA -o StrictHostKeyChecking=no $STAGE_SERVER_USER@$STAGE_SERVER_IP "docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY"
+    - ssh -p $STAGE_SERVER_PORT -i $ID_RSA -o StrictHostKeyChecking=no $STAGE_SERVER_USER@$STAGE_SERVER_IP "docker pull $IMAGE_NAME"
+    - ssh -p $STAGE_SERVER_PORT -i $ID_RSA -o StrictHostKeyChecking=no $STAGE_SERVER_USER@$STAGE_SERVER_IP "docker service update --force energi-js-stage"
+  tags:
+    - docker-runner
+  only:
+    refs:
+      - stage
+
+deploy prod:
+  stage: deploy_prod
+  image: alpine/helm:3.5.4
+  script:
+    - helm upgrade k8s ./k8s --install --set-string image.tag=${IMAGE_TAG} --timeout 45m0s
+  tags:
+    - kube-runner
+  only:
+    refs:
+      - develop
+      - stage
+      - prod
+  when: manual
